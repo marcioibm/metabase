@@ -5,13 +5,15 @@
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [honeysql.core :as hsql]
+            [clojure.set :as set]
             [metabase
              [driver :as driver]
              [public-settings :as pubset]]
             [metabase.driver.common :as driver.common]
             [metabase.driver.sql-jdbc
              [connection :as sql-jdbc.conn]
-             [execute :as sql-jdbc.execute]]
+             [execute :as sql-jdbc.execute]
+             [sync :as sql-jdbc.sync]]
             [metabase.driver.sql-jdbc.execute.legacy-impl :as legacy]
             [metabase.driver.sql.query-processor :as sql.qp]
             [metabase.mbql.util :as mbql.u]
@@ -22,7 +24,8 @@
              [honeysql-extensions :as hx]
              [i18n :refer [trs]]])
   (:import [java.sql ResultSet Types]
-           java.time.OffsetTime))
+           java.time.OffsetTime)
+  (:import java.sql.DatabaseMetaData))
 
 (driver/register! :redshift, :parent #{:postgres ::legacy/use-legacy-classes-for-read-and-set})
 
@@ -90,6 +93,37 @@
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                           metabase.driver.sql impls                                            |
 ;;; +----------------------------------------------------------------------------------------------------------------+
+
+
+(defn- get-tables
+  "Fetch a JDBC Metadata ResultSet of tables in the DB, optionally limited to ones belonging to a given schema."
+  [^DatabaseMetaData metadata ^String schema-or-nil ^String db-name-or-nil]
+  ;; tablePattern "%" = match all tables
+  (with-open [rs (.getTables metadata db-name-or-nil schema-or-nil "%"
+                             (into-array String ["TABLE" "VIEW" "FOREIGN TABLE" "MATERIALIZED VIEW" "EXTERNAL TABLE"]))]
+    (vec (jdbc/metadata-result rs))))
+
+(defn- fast-active-tables
+  "Default, fast implementation of `active-tables` best suited for DBs with lots of system tables (like Oracle). Fetch
+  list of schemas, then for each one not in `excluded-schemas`, fetch its Tables, and combine the results.
+
+  This is as much as 15x faster for Databases with lots of system tables than `post-filtered-active-tables` (4 seconds
+  vs 60)."
+  [driver ^DatabaseMetaData metadata & [db-name-or-nil]]
+  (with-open [rs (.getSchemas metadata)]
+    (let [all-schemas (set (map :table_schem (jdbc/metadata-result rs)))
+          schemas     (set/difference all-schemas (sql-jdbc.sync/excluded-schemas driver))]
+      (set (for [schema schemas
+                 table  (get-tables metadata schema db-name-or-nil)]
+             (let [remarks (:remarks table)]
+               {:name        (:table_name table)
+                :schema      schema
+                :description (when-not (str/blank? remarks)
+                               remarks)}))))))
+
+(defmethod sql-jdbc.sync/active-tables :redshift
+  [& args]
+  (apply fast-active-tables args))
 
 (defmethod sql.qp/add-interval-honeysql-form :redshift
   [_ hsql-form amount unit]
